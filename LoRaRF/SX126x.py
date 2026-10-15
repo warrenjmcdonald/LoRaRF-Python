@@ -1,5 +1,6 @@
 from .base import LoRaSpi, LoRaGpio, BaseLoRa
 from typing import Optional
+import threading
 import time
 from threading import Thread
 
@@ -247,6 +248,11 @@ class SX126x(BaseLoRa) :
     # SPI and GPIO pin setting
     _busyTimeout = 5000
     _irqTimeout = 10000
+    # track the RF-switch state in software: LoRaGpio.output() releases the
+    # gpiod line when the call returns, so the pin is undriven afterwards
+    # and its level cannot be read back with .input() - it can only be
+    # tracked. The driver is the only writer of these pins, so the tracked
+    # state is exact.
     _txState = LoRaGpio.LOW
     _rxState = LoRaGpio.LOW
 
@@ -270,6 +276,10 @@ class SX126x(BaseLoRa) :
     _statusWait = STATUS_DEFAULT
     _statusIrq = STATUS_DEFAULT
     _transmitTime = 0.0
+
+    # serialises SPI buffer access and the state fields above between the
+    # application thread(s) and the LoRaGpio IRQ monitor thread
+    _io_lock = threading.RLock()
 
     # callback functions
     _onTransmit = None
@@ -419,49 +429,75 @@ class SX126x(BaseLoRa) :
 
     def setTxPower(self, txPower: int, version = TX_POWER_SX1262) :
 
-        #  maximum TX power is 22 dBm and 15 dBm for SX1261
-        if txPower > 22 : txPower = 22
-        elif txPower > 15 and version == self.TX_POWER_SX1261 : txPower = 15
+        #  SetTxParams (0x8E) takes (power, RampTime) only.  The power byte
+        #  is NOT a direct dBm value: it is a PA control parameter whose
+        #  effect depends on the PA operating point selected with
+        #  SetPaConfig (0x95).  For the SX1262 the (operating point, power
+        #  byte) pairs below are RadioLib's empirically measured PA table
+        #  (bare chip, calibrated spectrum analyzer; radiolib-org/power-
+        #  tests, jgromes/RadioLib issue 1628), indexed by requested dBm
+        #  + 9: (paDutyCycle, hpMax, powerByte).  Levels -9 .. +14 drive
+        #  the chip's low-power output (PA_LOW); +15 .. +22 the high-power
+        #  output (PA_BOOST).  On modules with an onboard PA (EByte E22),
+        #  whether +15 .. +22 actually radiates depends on how the module
+        #  PA is fed and on the supply: the 30 dBm class needs >= 5 V
+        #  (high-power TX draws up to ~700 mA).
+        if version == self.TX_POWER_SX1261 :
+            if txPower > 15 : txPower = 15
+            if txPower < -17 : txPower = -17
+        elif version == self.TX_POWER_SX1262 :
+            if txPower > 22 : txPower = 22
+            if txPower < -9 : txPower = -9
+        else :
+            if txPower > 22 : txPower = 22
+            if txPower < -9 : txPower = -9
 
-        paDutyCycle = 0x00
-        hpMax = 0x00
         deviceSel = 0x00
-        power = 0x0E
         if version == self.TX_POWER_SX1261 : deviceSel = 0x01
-        # set parameters for PA config and TX params configuration
-        if txPower == 22 :
-            paDutyCycle = 0x04
-            hpMax = 0x07
-            power = 0x16
-        elif txPower >= 20 :
-            paDutyCycle = 0x03
-            hpMax = 0x05
-            power = 0x16
-        elif txPower >= 17 :
-            paDutyCycle = 0x02
-            hpMax = 0x03
-            power = 0x16
-        elif txPower >= 14 and version == self.TX_POWER_SX1261 :
-            paDutyCycle = 0x04
-            hpMax = 0x00
-            power = 0x0E
-        elif txPower >= 14 and version == self.TX_POWER_SX1262 :
-            paDutyCycle = 0x02
-            hpMax = 0x02
-            power = 0x16
-        elif txPower >= 14 and version == self.TX_POWER_SX1268 :
-            paDutyCycle = 0x04
-            hpMax = 0x06
-            power = 0x0F
-        elif txPower >= 10 and version == self.TX_POWER_SX1261 :
-            paDutyCycle = 0x01
-            hpMax = 0x00
-            power = 0x0D
-        elif txPower >= 10 and version == self.TX_POWER_SX1268 :
-            paDutyCycle = 0x00
-            hpMax = 0x03
-            power = 0x0F
-        else : return
+
+        if version == self.TX_POWER_SX1262 :
+            # RadioLib measured PA table (chip output = index - 9 dBm).
+            # Index 0 = -9 dBm ... index 31 = +22 dBm.  Values 0x00 .. 0x16
+            # are the power byte; 0xFB is -5 (unsigned byte of -5).
+            _pa = (
+                (0x02, 0x02, 0xFB), (0x02, 0x01, 0x00), (0x01, 0x01, 0x03),
+                (0x01, 0x02, 0x00), (0x01, 0x01, 0x06), (0x01, 0x02, 0x03),
+                (0x02, 0x02, 0x02), (0x04, 0x01, 0x06), (0x01, 0x01, 0x0B),
+                (0x02, 0x01, 0x0B), (0x01, 0x01, 0x0E), (0x02, 0x01, 0x0E),
+                (0x01, 0x01, 0x14), (0x01, 0x01, 0x16), (0x02, 0x02, 0x0B),
+                (0x03, 0x01, 0x15), (0x01, 0x02, 0x11), (0x04, 0x02, 0x0D),
+                (0x01, 0x02, 0x14), (0x01, 0x02, 0x16), (0x02, 0x02, 0x15),
+                (0x03, 0x02, 0x15), (0x01, 0x04, 0x13), (0x01, 0x04, 0x14),
+                (0x03, 0x03, 0x14), (0x02, 0x05, 0x13), (0x01, 0x06, 0x16),
+                (0x02, 0x05, 0x16), (0x03, 0x05, 0x16), (0x03, 0x06, 0x16),
+                (0x04, 0x06, 0x16), (0x04, 0x07, 0x16)
+            )
+            paDutyCycle, hpMax, power = _pa[txPower + 9]
+        elif version == self.TX_POWER_SX1268 :
+            # SX1268 keeps the original tabled PA operating points (its power
+            # byte scale differs and is not covered by the SX1262 table).
+            if txPower >= 14 :
+                paDutyCycle = 0x04
+                hpMax = 0x06
+                power = 0x0F
+            else :
+                paDutyCycle = 0x00
+                hpMax = 0x03
+                power = 0x0F
+        else :
+            # Low-power PA (SX1261), -17 .. +15 dBm.
+            if txPower >= 14 :
+                paDutyCycle = 0x04
+                hpMax = 0x00
+                power = txPower & 0xFF
+            elif txPower >= 10 :
+                paDutyCycle = 0x01
+                hpMax = 0x00
+                power = txPower & 0xFF
+            else :
+                paDutyCycle = 0x00
+                hpMax = 0x00
+                power = txPower & 0xFF
 
         # set power amplifier and TX power configuration
         self.setPaConfig(paDutyCycle, hpMax, deviceSel, 0x01)
@@ -606,38 +642,47 @@ class SX126x(BaseLoRa) :
 
     def beginPacket(self) :
 
-        # reset payload length and buffer index
-        self._payloadTxRx = 0
-        self.setBufferBaseAddress(self._bufferIndex, (self._bufferIndex + 0xFF) % 0xFF)
+        # enter standby and drop any pending RX event so the chip is deaf
+        # and the IRQ callback cannot clobber the TX buffer state while
+        # the frame is written (half-duplex, like the RNode firmware)
+        with self._io_lock :
+            self.setStandby(self.STANDBY_RC)
+            self.clearIrqStatus(0x03FF)
+            # reset payload length and buffer index
+            self._payloadTxRx = 0
+            self.setBufferBaseAddress(self._bufferIndex, (self._bufferIndex + 0xFF) % 0x100)
 
-        # save current txen and rxen pin state and set txen pin to high and rxen pin to low
-        if self._txen != None and self._rxen != None :
-            self._txState = self._txen.input()
-            self._rxState = self._rxen.input()
-            self._txen.output(LoRaGpio.HIGH)
-            self._rxen.output(LoRaGpio.LOW)
-        self._fixLoRaBw500(self._bw)
+            # switch antenna to TX. _txState/_rxState already track the
+            # pre-TX pin levels (class default LoRaGpio.LOW, restored after
+            # each operation) - they must NOT be read back with .input(),
+            # because gpiod releases the line on every request, so a read
+            # would return the undriven level, not the driven one
+            if self._txen != None and self._rxen != None :
+                self._txen.output(LoRaGpio.HIGH)
+                self._rxen.output(LoRaGpio.LOW)
+            self._fixLoRaBw500(self._bw)
 
     def endPacket(self, timeout: int = TX_SINGLE) -> bool :
 
         # skip to enter TX mode when previous TX operation incomplete
-        if self.getMode == self.STATUS_MODE_TX : return False
+        with self._io_lock :
+            if self.getMode() == self.STATUS_MODE_TX : return False
 
-        # clear previous interrupt and set TX done, and TX timeout as interrupt source
-        self._irqSetup(self.IRQ_TX_DONE | self.IRQ_TIMEOUT)
-        # set packet payload length
-        self.setPacketParamsLoRa(self._preambleLength, self._headerType, self._payloadTxRx, self._crcType, self._invertIq)
+            # clear previous interrupt and set TX done, and TX timeout as interrupt source
+            self._irqSetup(self.IRQ_TX_DONE | self.IRQ_TIMEOUT)
+            # set packet payload length
+            self.setPacketParamsLoRa(self._preambleLength, self._headerType, self._payloadTxRx, self._crcType, self._invertIq)
 
-        # set status to TX wait
-        self._statusWait = self.STATUS_TX_WAIT
-        self._statusIrq = 0x0000
-        # calculate TX timeout config
-        txTimeout = timeout << 6
-        if txTimeout > 0x00FFFFFF : txTimeout = self.TX_SINGLE
+            # set status to TX wait
+            self._statusWait = self.STATUS_TX_WAIT
+            self._statusIrq = 0x0000
+            # calculate TX timeout config
+            txTimeout = timeout << 6
+            if txTimeout > 0x00FFFFFF : txTimeout = self.TX_SINGLE
 
-        # set device to transmit mode with configured timeout or single operation
-        self.setTx(txTimeout)
-        self._transmitTime = time.time()
+            # set device to transmit mode with configured timeout or single operation
+            self.setTx(txTimeout)
+            self._transmitTime = time.time()
 
         # set operation status to wait and attach TX interrupt handler
         if self._irq != None :
@@ -659,9 +704,10 @@ class SX126x(BaseLoRa) :
         else :
             raise TypeError("input data must be list, tuple, integer or float")
         # write data to buffer and update buffer index and payload
-        self.writeBuffer(self._bufferIndex, data, length)
-        self._bufferIndex = (self._bufferIndex + length) % 256
-        self._payloadTxRx += length
+        with self._io_lock :
+            self.writeBuffer(self._bufferIndex, data, length)
+            self._bufferIndex = (self._bufferIndex + length) % 256
+            self._payloadTxRx += length
 
     def put(self, data) :
 
@@ -671,9 +717,10 @@ class SX126x(BaseLoRa) :
             length = len(dataList)
         else : raise TypeError("input data must be bytes or bytearray")
         # write data to buffer and update buffer index and payload
-        self.writeBuffer(self._bufferIndex, dataList, length)
-        self._bufferIndex = (self._bufferIndex + length) % 256
-        self._payloadTxRx += length
+        with self._io_lock :
+            self.writeBuffer(self._bufferIndex, dataList, length)
+            self._bufferIndex = (self._bufferIndex + length) % 256
+            self._payloadTxRx += length
 
 ### RECEIVE RELATED METHODS ###
 
@@ -683,27 +730,28 @@ class SX126x(BaseLoRa) :
         if self.getMode() == self.STATUS_MODE_RX : return False
 
         # clear previous interrupt and set RX done, RX timeout, header error, and CRC error as interrupt source
-        self._irqSetup(self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR)
+        with self._io_lock :
+            self._irqSetup(self.IRQ_RX_DONE | self.IRQ_TIMEOUT | self.IRQ_HEADER_ERR | self.IRQ_CRC_ERR)
 
-        # set status to RX wait or RX continuous wait
-        self._statusWait = self.STATUS_RX_WAIT
-        self._statusIrq = 0x0000
-        # calculate RX timeout config
-        rxTimeout = timeout << 6
-        if rxTimeout > 0x00FFFFFF : rxTimeout = self.RX_SINGLE
-        if timeout == self.RX_CONTINUOUS :
-            rxTimeout = self.RX_CONTINUOUS
-            self._statusWait = self.STATUS_RX_CONTINUOUS
+            # set status to RX wait or RX continuous wait
+            self._statusWait = self.STATUS_RX_WAIT
+            self._statusIrq = 0x0000
+            # calculate RX timeout config
+            rxTimeout = timeout << 6
+            if rxTimeout > 0x00FFFFFF : rxTimeout = self.RX_SINGLE
+            if timeout == self.RX_CONTINUOUS :
+                rxTimeout = self.RX_CONTINUOUS
+                self._statusWait = self.STATUS_RX_CONTINUOUS
 
-        # save current txen and rxen pin state and set txen pin to low and rxen pin to high
-        if self._txen != None and self._rxen != None :
-            self._txState = self._txen.input()
-            self._rxState = self._rxen.input()
-            self._txen.output(LoRaGpio.LOW)
-            self._rxen.output(LoRaGpio.HIGH)
+            # switch antenna to RX. Pin state is tracked in software (see
+            # the _txState/_rxState class attributes) - gpiod lines are
+            # undriven after every request, so they cannot be read back.
+            if self._txen != None and self._rxen != None :
+                self._txen.output(LoRaGpio.LOW)
+                self._rxen.output(LoRaGpio.HIGH)
 
-        # set device to receive mode with configured timeout, single, or continuous operation
-        self.setRx(rxTimeout)
+            # set device to receive mode with configured timeout, single, or continuous operation
+            self.setRx(rxTimeout)
 
         # set operation status to wait and attach RX interrupt handler
         if self._irq != None :
@@ -735,10 +783,10 @@ class SX126x(BaseLoRa) :
         if rxPeriod > 0x00FFFFFF : rxPeriod = 0x00FFFFFF
         if sleepPeriod > 0x00FFFFFF : sleepPeriod = 0x00FFFFFF
 
-        # save current txen and rxen pin state and set txen pin to low and rxen pin to high
+        # switch antenna to RX. Pin state is tracked in software (see
+        # the _txState/_rxState class attributes) - gpiod lines are
+        # undriven after every request, so they cannot be read back.
         if self._txen != None and self._rxen != None :
-            self._txState = self._txen.input()
-            self._rxState = self._rxen.input()
             self._txen.output(LoRaGpio.LOW)
             self._rxen.output(LoRaGpio.HIGH)
 
@@ -767,12 +815,13 @@ class SX126x(BaseLoRa) :
             length = 1
             single = True
         # read data from buffer and update buffer index and payload
-        buf = self.readBuffer(self._bufferIndex, length)
-        self._bufferIndex = (self._bufferIndex + length) % 256
-        if self._payloadTxRx > length :
-            self._payloadTxRx -= length
-        else :
-            self._payloadTxRx = 0
+        with self._io_lock :
+            buf = self.readBuffer(self._bufferIndex, length)
+            self._bufferIndex = (self._bufferIndex + length) % 256
+            if self._payloadTxRx > length :
+                self._payloadTxRx -= length
+            else :
+                self._payloadTxRx = 0
         # return single byte or tuple
         if single : return buf[0]
         else : return buf
@@ -780,13 +829,27 @@ class SX126x(BaseLoRa) :
     def get(self, length: int = 1) -> bytes :
 
         # read data from buffer and update buffer index and payload
-        buf = self.readBuffer(self._bufferIndex, length)
-        self._bufferIndex = (self._bufferIndex + length) % 256
-        if self._payloadTxRx > length :
-            self._payloadTxRx -= length
-        else :
-            self._payloadTxRx = 0
+        with self._io_lock :
+            buf = self.readBuffer(self._bufferIndex, length)
+            self._bufferIndex = (self._bufferIndex + length) % 256
+            if self._payloadTxRx > length :
+                self._payloadTxRx -= length
+            else :
+                self._payloadTxRx = 0
         # return array of bytes
+        return bytes(buf)
+
+    def drain(self) -> bytes :
+
+        # atomically read the whole pending payload, if any. This is what
+        # the RNS SX126xInterface RX loop uses: the chip is half-duplex, so
+        # the frame must be pulled out of the FIFO in one critical section.
+        with self._io_lock :
+            length = self._payloadTxRx
+            if length <= 0 : return b""
+            buf = self.readBuffer(self._bufferIndex, length)
+            self._bufferIndex = (self._bufferIndex + length) % 256
+            self._payloadTxRx = 0
         return bytes(buf)
 
     def purge(self, length: int = 0) :
@@ -814,31 +877,78 @@ class SX126x(BaseLoRa) :
             if self._irq == None : irqStat = self.getIrqStatus()
             # return when timeout reached
             if (time.time() - t) > timeout and timeout > 0 : return False
+            # avoid burning a full CPU core while polling for the IRQ flag
+            time.sleep(0.001)
 
         if self._statusIrq :
             # immediately return when interrupt signal hit
             return True
         elif self._statusWait == self.STATUS_TX_WAIT :
             # for transmit, calculate transmit time and set back txen and rxen pin to previous state
-            self._transmitTime = time.time() - self._transmitTime
+            with self._io_lock :
+                self._transmitTime = time.time() - self._transmitTime
             if self._txen != None and self._rxen != None :
                 self._txen.output(self._txState)
                 self._rxen.output(self._rxState)
         elif self._statusWait == self.STATUS_RX_WAIT :
             # for receive, get received payload length and buffer index and set back txen and rxen pin to previous state
-            (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
+            with self._io_lock :
+                (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
+                self._fixRxTimeout()
             if self._txen != None and self._rxen != None :
                 self._txen.output(self._txState)
                 self._rxen.output(self._rxState)
-            self._fixRxTimeout()
         elif self._statusWait == self.STATUS_RX_CONTINUOUS :
             # for receive continuous, get received payload length and buffer index and clear IRQ status
-            (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
-            self.clearIrqStatus(0x03FF)
+            with self._io_lock :
+                (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
+                self.clearIrqStatus(0x03FF)
 
         # store IRQ status
         self._statusIrq = irqStat
         return True
+
+    def healTxDone(self) -> bool :
+
+        # Reconcile a transmit wait that timed out. The TxDone GPIO edge
+        # can be missed (CPU-starved callback thread) or arrive late while
+        # the chip has already finished transmitting and returned to
+        # standby. Reading the chip's IRQ register resolves the ambiguity
+        # without paying for a full frame retransmit:
+        #   IRQ_TIMEOUT set    -> genuine chip-side TX timeout (not sent)
+        #   IRQ_TX_DONE set    -> transmit completed, the edge was missed
+        #   no flags + standby -> indistinguishable from completed; assume
+        #                         sent (the RNS link layer retransmits
+        #                         unacknowledged packets, so nothing is
+        #                         lost if this assumption is wrong)
+        # In the "completed" cases this restores the RF switch pins and
+        # records the transmit time exactly as _interruptTx() would have,
+        # which also prevents beginPacket() from sampling the stuck TX
+        # state as the "previous" state on the next transmit (a missed
+        # edge would otherwise leave the antenna switch in TX mode).
+        # Returns True when the frame may be considered sent.
+        with self._io_lock :
+            if self._statusWait != self.STATUS_TX_WAIT :
+                return False
+            # a delayed IRQ callback may have landed between wait() and
+            # this call; its stored IRQ status is authoritative
+            irqStat = self._statusIrq
+            if irqStat == 0x0000 : irqStat = self.getIrqStatus()
+            if irqStat & self.IRQ_TIMEOUT :
+                self._statusIrq = irqStat
+                return False
+            if (irqStat & self.IRQ_TX_DONE) or self.getMode() in (self.STATUS_MODE_STDBY_RC, self.STATUS_MODE_STDBY_XOSC) :
+                if self._statusIrq == 0x0000 :
+                    # the edge never arrived: restore the RF switch pins
+                    # and record the transmit time
+                    self._transmitTime = time.time() - self._transmitTime
+                    if self._txen != None and self._rxen != None :
+                        self._txen.output(self._txState)
+                        self._rxen.output(self._rxState)
+                self._statusIrq = irqStat | self.IRQ_TX_DONE
+                return True
+            # still in TX mode or in an unexpected state: unresolved
+            return False
 
     def status(self) -> int :
 
@@ -913,14 +1023,15 @@ class SX126x(BaseLoRa) :
 
     def _interruptTx(self) :
 
-        # calculate transmit time
-        self._transmitTime = time.time() - self._transmitTime
-        # set back txen and rxen pin to previous state
-        if self._txen != None and self._rxen != None :
-            self._txen.output(self._txState)
-            self._rxen.output(self._rxState)
-        # store IRQ status
-        self._statusIrq = self.getIrqStatus()
+        with self._io_lock :
+            # calculate transmit time
+            self._transmitTime = time.time() - self._transmitTime
+            # set back txen and rxen pin to previous state
+            if self._txen != None and self._rxen != None :
+                self._txen.output(self._txState)
+                self._rxen.output(self._rxState)
+            # store IRQ status
+            self._statusIrq = self.getIrqStatus()
 
         # call onTransmit function
         if callable(self._onTransmit) :
@@ -928,15 +1039,16 @@ class SX126x(BaseLoRa) :
 
     def _interruptRx(self) :
 
-        # set back txen and rxen pin to previous state
-        if self._txen != None and self._rxen != None :
-            self._txen.output(self._txState)
-            self._rxen.output(self._rxState)
-        self._fixRxTimeout()
-        # store IRQ status
-        self._statusIrq = self.getIrqStatus()
-        # get received payload length and buffer index
-        (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
+        with self._io_lock :
+            # set back txen and rxen pin to previous state
+            if self._txen != None and self._rxen != None :
+                self._txen.output(self._txState)
+                self._rxen.output(self._rxState)
+            self._fixRxTimeout()
+            # store IRQ status
+            self._statusIrq = self.getIrqStatus()
+            # get received payload length and buffer index
+            (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
 
         # call onReceive function
         if callable(self._onReceive) :
@@ -944,12 +1056,17 @@ class SX126x(BaseLoRa) :
 
     def _interruptRxContinuous(self) :
 
-        # store IRQ status
-        self._statusIrq = self.getIrqStatus()
-        # clear IRQ status
-        self.clearIrqStatus(0x03FF)
-        # get received payload length and buffer index
-        (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
+        with self._io_lock :
+            # do not clobber TX buffer state while a transmit is in flight
+            if self._statusWait == self.STATUS_TX_WAIT :
+                self.clearIrqStatus(0x03FF)
+                return
+            # store IRQ status
+            self._statusIrq = self.getIrqStatus()
+            # clear IRQ status
+            self.clearIrqStatus(0x03FF)
+            # get received payload length and buffer index
+            (self._payloadTxRx, self._bufferIndex) = self.getRxBufferStatus()
 
         # call onReceive function
         if callable(self._onReceive) :
