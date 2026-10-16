@@ -51,20 +51,45 @@ class LoRaGpio:
         ) as request:
             return request.get_value(self.offset)
 
-    def monitor(self, callback, timeout: float):
+    def monitor(self, callback, timeout: float = 0):
+        # Monitor this line for rising edges and invoke callback() for
+        # each edge.
+        #
+        # timeout == 0 (the default; this is the mode the SX126x driver
+        # uses): persistent monitor - the line is requested once and
+        # every edge is delivered to the callback until the thread
+        # dies. The SX126x driver runs exactly one such thread for the
+        # lifetime of the radio (see SX126x._ensureMonitor()). The old
+        # scheme - spawning a short-lived monitor thread for every
+        # request()/listen()/endPacket() and joining it at the start of
+        # the next operation - was racy: an edge arriving while the old
+        # thread was being joined was consumed (and dropped) by the
+        # stale thread, and a stale monitor with a near-infinite
+        # timeout could wedge the join for hours.
+        #
+        # timeout > 0 (legacy one-shot): stop after the first edge or
+        # when the timeout elapses.        
         t = time.time()
         with gpiod.request_lines(
             self.chip,
             consumer="LoRaGpio",
             config={self.offset: gpiod.LineSettings(edge_detection=Edge.RISING)}
         ) as request:
-            while (time.time() - t) < timeout or timeout == 0:
+           while True:
+                if timeout > 0 and (time.time() - t) >= timeout:
+                    return
+                if timeout > 0:
+                    # unblock periodically so the deadline above is
+                    # honoured (read_edge_events() alone blocks until
+                    # the next edge); fall back to a plain blocking
+                    # read on gpiod builds without wait_edge_events()
+                    if hasattr(request, "wait_edge_events"):
+                        if not request.wait_edge_events(0.25):
+                            continue            
                 for event in request.read_edge_events():
-                    if event.line_seqno != self.seqno:
-                        self.seqno = event.line_seqno
-                        callback()
+                    callback()
+                    if timeout > 0:
                         return
-
 
 class BaseLoRa :
 
