@@ -252,9 +252,12 @@ class SX126x(BaseLoRa) :
     # gpiod line when the call returns, so the pin is undriven afterwards
     # and its level cannot be read back with .input() - it can only be
     # tracked. The driver is the only writer of these pins, so the tracked
-    # state is exact.
+    # state is exact. The radio idles in RX mode, so the tracked state
+    # (restored by the IRQ handlers and wait() after every operation) is
+    # the RX-switch position: TXEN low, RXEN high. The old LOW/LOW default
+    # disconnected the antenna after every interrupt restore.
     _txState = LoRaGpio.LOW
-    _rxState = LoRaGpio.LOW
+    _rxState = LoRaGpio.HIGH
 
     # LoRa setting
     _dio = 1
@@ -308,6 +311,10 @@ class SX126x(BaseLoRa) :
             return False
         self.setPacketType(self.LORA_MODEM)
         self._fixResistanceAntenna()
+        # start the persistent IRQ monitor so it is alive before the
+        # first request()/endPacket() (those methods call _ensureMonitor()
+        # as well, as a backstop if begin() was bypassed)
+        self._ensureMonitor()
         return True
 
     def end(self) :
@@ -684,13 +691,13 @@ class SX126x(BaseLoRa) :
             self.setTx(txTimeout)
             self._transmitTime = time.time()
 
-        # set operation status to wait and attach TX interrupt handler
-        if self._irq != None :
-            if isinstance(self._monitoring, Thread):
-                self._monitoring.join()
-            to = self._irqTimeout/1000 if timeout == self.TX_SINGLE else timeout/1000
-            self._monitoring = Thread(target=self._irq.monitor, args=(self._interruptTx, to))
-            self._monitoring.start()
+        # make sure the persistent IRQ monitor is running; it catches the
+        # TX-done edge (DIO1 asserts only once, at the end of the
+        # transmission) and routes it to _interruptTx() because
+        # _statusWait is STATUS_TX_WAIT. No per-operation thread is
+        # spawned or joined here, so the TX-done edge can no longer be
+        # consumed by a stale monitor thread.
+        self._ensureMonitor()
         return True
 
     def write(self, data, length: int = 0) :
@@ -726,6 +733,11 @@ class SX126x(BaseLoRa) :
 
     def request(self, timeout: int = RX_SINGLE) -> bool :
 
+        # re-arm a dead persistent IRQ monitor before the no-op early
+        # return below, so a transient gpiod failure self-heals even
+        # when the chip is already in RX (otherwise RX would fall back
+        # to register polling until the chip next leaves RX mode)
+        self._ensureMonitor()
         # skip to enter RX mode when previous RX operation incomplete
         if self.getMode() == self.STATUS_MODE_RX : return False
 
@@ -753,21 +765,18 @@ class SX126x(BaseLoRa) :
             # set device to receive mode with configured timeout, single, or continuous operation
             self.setRx(rxTimeout)
 
-        # set operation status to wait and attach RX interrupt handler
-        if self._irq != None :
-            if isinstance(self._monitoring, Thread):
-                self._monitoring.join()
-            to = self._irqTimeout/1000 if timeout == self.RX_SINGLE else timeout/1000
-            if timeout == self.RX_CONTINUOUS:
-                self._monitoring = Thread(target=self._irq.monitor, args=(self._interruptRxContinuous, to))
-                self._monitoring.setDaemon(True)
-            else:
-                self._monitoring = Thread(target=self._irq.monitor, args=(self._interruptRx, to))
-            self._monitoring.start()
+        # make sure the persistent IRQ monitor is running; it dispatches
+        # the RX edges to _interruptRx() / _interruptRxContinuous() based
+        # on the _statusWait set above (no per-operation thread to join,
+        # so an edge can no longer be eaten by a stale monitor)
+        self._ensureMonitor()
         return True
 
     def listen(self, rxPeriod: int, sleepPeriod: int) -> bool :
 
+        # re-arm a dead persistent IRQ monitor before the no-op early
+        # return (same rationale as in request())
+        self._ensureMonitor()
         # skip to enter RX mode when previous RX operation incomplete
         if self.getMode() == self.STATUS_MODE_RX : return False
 
@@ -793,13 +802,9 @@ class SX126x(BaseLoRa) :
         # set device to receive mode with configured receive and sleep period
         self.setRxDutyCycle(rxPeriod, sleepPeriod)
 
-        # set operation status to wait and attach RX interrupt handler
-        if self._irq != None :
-            if isinstance(self._monitoring, Thread):
-                self._monitoring.join()
-            to = self._irqTimeout/1000 if rxPeriod == self.RX_SINGLE else rxPeriod/1000
-            self._monitoring = Thread(target=self._irq.monitor, args=(self._interruptRx, to))
-            self._monitoring.start()
+        # make sure the persistent IRQ monitor is running (it dispatches
+        # the RX-duty-cycle edges to _interruptRx())
+        self._ensureMonitor()
         return True
 
     def available(self) -> int :
@@ -869,12 +874,19 @@ class SX126x(BaseLoRa) :
         if self._statusIrq :
             return True
 
+        # if the persistent monitor died (e.g. gpiod refused the line on
+        # start), restart it so edge detection self-heals
+        if self._irq != None and (self._monitoring == None or not self._monitoring.is_alive()) :
+            self._ensureMonitor()
+
         # wait transmit or receive process finish by checking IRQ status
         irqStat = 0x0000
         t = time.time()
         while irqStat == 0x0000 and self._statusIrq == 0x0000 :
-            # only check IRQ status register for non interrupt operation
+            # check the IRQ status register for non interrupt operation,
+            # or when the interrupt monitor is not (yet) running
             if self._irq == None : irqStat = self.getIrqStatus()
+            elif isinstance(self._monitoring, Thread) and not self._monitoring.is_alive() : irqStat = self.getIrqStatus()
             # return when timeout reached
             if (time.time() - t) > timeout and timeout > 0 : return False
             # avoid burning a full CPU core while polling for the IRQ flag
@@ -1021,6 +1033,46 @@ class SX126x(BaseLoRa) :
         else : dio1Mask = irqMask
         self.setDioIrqParams(irqMask, dio1Mask, dio2Mask, dio3Mask)
 
+    def _ensureMonitor(self) :
+
+        # (Re)start the single persistent DIO1 monitor thread when it is
+        # not running. One thread requests the IRQ line for the lifetime
+        # of the radio and dispatches every edge to the handler that
+        # matches the operation in progress (see _interruptDispatch()).
+        # This replaces the old scheme of spawning - and joining - a
+        # short-lived monitor thread for every request()/listen()/
+        # endPacket(): an edge arriving while the old thread was being
+        # joined was consumed by the stale thread (the TX-done edge was
+        # eaten by the previous RX monitor and dropped by its guard, so
+        # wait() timed out on every transmit), and a stale monitor with a
+        # near-infinite timeout could wedge the join for hours.
+        if self._irq == None : return
+        with self._io_lock :
+            if self._monitoring != None and self._monitoring.is_alive() : return
+            self._monitoring = Thread(target=self._irq.monitor, args=(self._interruptDispatch, 0))
+            self._monitoring.setDaemon(True)
+            self._monitoring.start()
+
+    def _interruptDispatch(self) :
+
+        # single persistent DIO1 callback: route the edge to the handler
+        # that matches the operation in progress. _io_lock is held across
+        # the dispatch (it is re-entrant, the handlers take it again) so
+        # the state check and the handler are atomic with respect to
+        # request()/endPacket() switching the operation.
+        with self._io_lock :
+            if self._statusWait == self.STATUS_TX_WAIT :
+                self._interruptTx()
+            elif self._statusWait == self.STATUS_RX_WAIT :
+                self._interruptRx()
+            elif self._statusWait == self.STATUS_RX_CONTINUOUS :
+                self._interruptRxContinuous()
+            else :
+                # stray edge while no operation is in progress: clear the
+                # chip IRQ so DIO1 can de-assert (a stuck-high line would
+                # swallow the next edge)
+                self.clearIrqStatus(0x03FF)
+
     def _interruptTx(self) :
 
         with self._io_lock :
@@ -1032,6 +1084,10 @@ class SX126x(BaseLoRa) :
                 self._rxen.output(self._rxState)
             # store IRQ status
             self._statusIrq = self.getIrqStatus()
+            # clear the chip IRQ so DIO1 de-asserts right after TX
+            # (otherwise the line stays high until the next _irqSetup()
+            # and a stuck-high line swallows the next edge)
+            self.clearIrqStatus(0x03FF)
 
         # call onTransmit function
         if callable(self._onTransmit) :
