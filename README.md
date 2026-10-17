@@ -1,13 +1,11 @@
 <!-- PROJECT SHIELDS -->
-[![PyPI - Downloads](https://img.shields.io/pypi/dm/LoRaRF)](https://pypi.org/project/LoRaRF/)
-[![PyPI](https://img.shields.io/pypi/v/LoRaRF)](https://pypi.org/project/LoRaRF/)
 [![GitHub license](https://img.shields.io/github/license/chandrawi/LoRaRF-Python)](https://github.com/chandrawi/LoRaRF-Python/blob/main/LICENSE)
 
 # LoRa-RF Python Library
 
 LoRa-RF Python is a library for basic transmitting and receiving data using LoRa module with Semtech SX126x series, SX127x series, or LLCC68. The library works by interfacing SPI port and some GPIO pins under linux kernel. Support configuring frequency, modulation parameter, transmit power, receive gain and other RF parameters on both LoRa and FSK modulation also support handling transmit and receive using interrupt signal.
 
-This readme is written for quick start guide. Visit this [link](https://github.com/chandrawi/LoRaRF-Python/wiki) for complete documentation.
+This readme is written for quick start guide. Visit this [link](https://github.com/warrenjmcdonald/LoRaRF-Python/wiki) for complete documentation.
 
 ## Hardware Compatibility
 
@@ -25,28 +23,14 @@ dtparam=spi=on
 
 ## Installation
 
-### Using pip
-
-Using terminal run following command.
-```sh
-pip3 install LoRaRF
-```
-
 ### Using Git and Build Package
 
 To using latest update of the library, you can clone then build python package manually. Using this method require setuptools and wheel module.
 ```sh
-git clone https://github.com/chandrawi/LoRaRF-Python.git
+git clone https://github.com/warrenjmcdonald/LoRaRF-Python.git
 cd LoRaRF-Python
 python3 setup.py bdist_wheel
-pip3 install dist/LoRaRF-1.4.0-py3-none-any.whl
-```
-
-### If you run into problems installing the package, another option is creating a virtual environment
-```sh
-python -m venv lora
-source lora/bin/activate
-pip install LoRaRF
+pip3 install dist/LoRaRF-1.5.0-py3-none-any.whl
 ```
 
 ## Initialization
@@ -197,9 +181,11 @@ For more detail about receive operation, please visit this [link](https://github
 
 See examples for [SX126x](https://github.com/chandrawi/LoRaRF-Python/tree/main/examples/SX126x), [SX127x](https://github.com/chandrawi/LoRaRF-Python/tree/main/examples/SX127x) and [simple network implementation](https://github.com/chandrawi/LoRaRF-Python/tree/main/examples/network).
 
-## Contributor
+## Contributors
 
+[Warren McDonald](https://github.com/warrenjmcdonald) 
 [Chandra Wijaya Sentosa](https://github.com/chandrawi) <<chandra.w.sentosa@gmail.com>>
 
 ### Upcoming features...
-Base class will allow for python3-libgpiod package
+Expand pin definitions to include EN Line and Status LEDs
+
